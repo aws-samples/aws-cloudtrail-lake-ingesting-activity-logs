@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  aws-cloudtrail-lake-ingesting-azure-activity-logs
+  SAM Template for aws-cloudtrail-lake-ingesting-azure-activity-logs
+Parameters:
+  CloudTrailEventDataStoreArn:
+    Type: String
+    Description: '[Optional] Arn of the event data store into which the Microsoft Azure administrative Logs will be ingested. If no Arn is provided, a new event data store will be created.'
+    Default: ''
+  CloudTrailEventRetentionPeriod:
+    Type: Number
+    Description: Number of days CloudTrail should retain events in the data store
+    MinValue: 7
+    MaxValue: 2557
+    Default: 7
+  AzureEventHubsNamespace:
+    Type: String
+    Description: Name of the Azure Event Hubs Namespace
+  AzureEventHubsName:
+    Type: String
+    Description: Name of the Azure EventHub Instance
+  AzureEventHubsSharedAccessPolicyName:
+    Type: String
+    Description: Name of the Shared Access Policy for Azure Event Hubs Instance
+  AzureEventHubsSharedAccessKey:
+    Type: String
+    Description: Shared Access Policy Key for Azure Event Hubs Instance. This will be stored on AWS Secrets Manager
+    NoEcho: true
+  AzureStorageAccountName:
+    Type: String
+    Description: Name of the Azure Storage Account
+  AzureStorageContainerName:
+    Type: String
+    Description: Name of the Azure Storage Blog Container
+  AzureStorageAccountAccessKey:
+    Type: String
+    Description: Access Key for Azure Storage Account. This will be stored on AWS Secrets Manager
+    NoEcho: true
+  UserType:
+    Type: String
+    Description: The value that will be applied to the userIdentity.type field of each audit event ingested into CloudTrail Lake
+    Default: MSAzureUser
+Globals:
+  Function:
+    Timeout: 120
+Conditions:
+  CreateEventDataStore: !Equals
+    - !Ref CloudTrailEventDataStoreArn
+    - ''
+Resources:
+  AzureEventHubsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      KmsMasterKeyId: alias/aws/sqs
+  GetAzureMessagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/getazuremessages/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      PackageType: Zip
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          SQS_QUEUE_NAME: !Ref AzureEventHubsQueue
+          SECRET_NAME: !Ref AzureConnectionSecret
+          AZURE_EVENTHUBS_NAMESPACE: !Ref AzureEventHubsNamespace
+          AZURE_EVENTHUBS_NAME: !Ref AzureEventHubsName
+          AZURE_EVENTHUBS_SHARED_ACCESS_POLICY_NAME: !Ref AzureEventHubsSharedAccessPolicyName
+          AZURE_EVENTHUBS_CONSUMER_GROUP: $Default
+          AZURE_STORAGE_ACCOUNT_NAME: !Ref AzureStorageAccountName
+          AZURE_STORAGE_CONTAINER_NAME: !Ref AzureStorageContainerName
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt AzureEventHubsQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AzureConnectionSecret
+  AzureConnectionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      SecretString: !Sub '{"azureeventhubaccesskey": "${AzureEventHubsSharedAccessKey}", "azurestorageaccountaccesskey": "${AzureStorageAccountAccessKey}"}'
+      KmsKeyId: alias/aws/secretsmanager
+  UpdateCloudTrailLake:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambda/update-cloudtrail-lake/
+      Handler: main.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Architectures:
+        -	arm64
+      Environment:
+        Variables:
+          CLOUDTRAIL_LAKE_CHANNEL_ARN: !GetAtt CTLakeChannel.ChannelArn
+          DEFAULT_USER_TYPE: !Ref UserType
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AzureEventHubsQueue.Arn
+            BatchSize: 10
+  NewCloudTrailEventDataStore:
+    Type: AWS::CloudTrail::EventDataStore
+    Condition: CreateEventDataStore
+    Properties:
+      MultiRegionEnabled: false
+      OrganizationEnabled: false
+      RetentionPeriod: !Ref CloudTrailEventRetentionPeriod
+      AdvancedEventSelectors:
+        - FieldSelectors:
+            - Field: eventCategory
+              Equals:
+                - ActivityAuditLog
+      TerminationProtectionEnabled: false
+  CTLakeChannel:
+    Type: AWS::CloudTrail::Channel
+    Properties:
+      Source: Custom
+      Destinations:
+        - Type: EVENT_DATA_STORE
+          Location: !If
+            - CreateEventDataStore
+            - !Ref NewCloudTrailEventDataStore
+            - !Ref CloudTrailEventDataStoreArn
+  Scheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Schedule the runs every hour to pull messages from Azure Event Hub.
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: rate(1 hour)
+      Target:
+        Arn: !GetAtt GetAzureMessagesFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GetAzureMessagesFunction.Arn
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  LambdaExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AzureAuditEventsCTLake_Lambda_Role_Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudtrail-data:PutAuditEvents
+            Resource: !GetAtt CTLakeChannel.ChannelArn
+          - Effect: Allow
+            Action:
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ReceiveMessage
+            Resource: !GetAtt AzureEventHubsQueue.Arn
+      Roles:
+        - !Ref LambdaExecutionRole
+Outputs:
+  EventDataStoreId:
+    Description: The Id of the CloudTrail Event Data Store which will be used when querying events in CloudTrail Lake.
+    Value: !If
+      - CreateEventDataStore
+      - !Select
+        - 1
+        - !Split
+          - /
+          - !Ref NewCloudTrailEventDataStore
+      - !Select
+        - 1
+        - !Split
+          - /
+          - !Ref CloudTrailEventDataStoreArn

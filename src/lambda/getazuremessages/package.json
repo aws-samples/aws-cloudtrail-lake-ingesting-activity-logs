@@ -1,0 +1,16 @@
+{
+  "name": "getazuremessages",
+  "version": "1.0.0",
+  "description": "Lambda Function to fetch messages from Azure Event Hub",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@azure/eventhubs-checkpointstore-blob": "^1.0.1",
+    "@azure/storage-blob": "^12.16.0",
+    "aws-sdk": "^2.1486.0"
+  }
+}
