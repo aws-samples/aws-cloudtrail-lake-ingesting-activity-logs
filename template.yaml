@@ -91,7 +91,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Runtime: python3.12
       Architectures:
-        -	arm64
+        - arm64
       Environment:
         Variables:
           CLOUDTRAIL_LAKE_CHANNEL_ARN: !GetAtt CTLakeChannel.ChannelArn
